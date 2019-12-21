@@ -20,13 +20,18 @@
 #include "v4l2_subdevice.h"
 #include "v4l2_videodevice.h"
 
+#define MAX_PHYS 4
+#define MAX_SUBDEVS 4
+#define MAX_VDEVS 4
+
 namespace libcamera {
 LOG_DEFINE_CATEGORY(Simple)
 
 struct SimplePipelineInfo {
 	std::string driverName;
-	std::string phyName;
-	std::string v4l2Name;
+	std::string phyNames[MAX_PHYS];
+	std::string subdevNames[MAX_SUBDEVS];
+	std::string vdevNames[MAX_VDEVS];
 	unsigned int v4l2PixFmt;
 	unsigned int mediaBusFmt;
 	unsigned int maxWidth;
@@ -113,8 +118,9 @@ private:
 	void bufferReady(Buffer *buffer);
 
 	MediaDevice *media_;
-	V4L2Subdevice *dphy_;
-	V4L2VideoDevice *video_;
+	V4L2Subdevice *dphy_[MAX_PHYS];
+	V4L2Subdevice *subdev_[MAX_SUBDEVS];
+	V4L2VideoDevice *video_[MAX_VDEVS];
 
 	Camera *activeCamera_;
 
@@ -195,14 +201,20 @@ CameraConfiguration::Status SimpleCameraConfiguration::validate()
 }
 
 PipelineHandlerSimple::PipelineHandlerSimple(CameraManager *manager)
-	: PipelineHandler(manager), dphy_(nullptr), video_(nullptr)
+	: PipelineHandler(manager)
 {
 }
 
 PipelineHandlerSimple::~PipelineHandlerSimple()
 {
-	delete video_;
-	delete dphy_;
+	for (int i = 0; video_[i]; i++)
+		delete[] video_[i];
+
+	for (int i = 0; subdev_[i]; i++)
+		delete[] subdev_[i];
+
+	for (int i = 0; dphy_[i]; i++)
+		delete[] dphy_[i];
 }
 
 /* -----------------------------------------------------------------------------
@@ -242,7 +254,7 @@ int PipelineHandlerSimple::configure(Camera *camera, CameraConfiguration *c)
          * Configure the sensor links: enable the link corresponding to this
          * camera and disable all the other sensor links.
          */
-	const MediaPad *pad = dphy_->entity()->getPadByIndex(0);
+	const MediaPad *pad = dphy_[0]->entity()->getPadByIndex(0);
 
 	for (MediaLink *link : pad->links()) {
 		bool enable = link->source()->entity() == sensor->entity();
@@ -279,7 +291,7 @@ int PipelineHandlerSimple::configure(Camera *camera, CameraConfiguration *c)
 	outputFormat.size = cfg.size;
 	outputFormat.planesCount = 2;
 
-	ret = video_->setFormat(&outputFormat);
+	ret = video_[0]->setFormat(&outputFormat);
 	if (ret)
 		return ret;
 
@@ -301,15 +313,15 @@ int PipelineHandlerSimple::allocateBuffers(Camera *camera,
 	Stream *stream = *streams.begin();
 
 	if (stream->memoryType() == InternalMemory)
-		return video_->exportBuffers(&stream->bufferPool());
+		return video_[0]->exportBuffers(&stream->bufferPool());
 	else
-		return video_->importBuffers(&stream->bufferPool());
+		return video_[0]->importBuffers(&stream->bufferPool());
 }
 
 int PipelineHandlerSimple::freeBuffers(Camera *camera,
 				       const std::set<Stream *> &streams)
 {
-	if (video_->releaseBuffers())
+	if (video_[0]->releaseBuffers())
 		LOG(Simple, Error) << "Failed to release buffers";
 
 	return 0;
@@ -319,7 +331,7 @@ int PipelineHandlerSimple::start(Camera *camera)
 {
 	int ret;
 
-	ret = video_->streamOn();
+	ret = video_[0]->streamOn();
 	if (ret)
 		LOG(Simple, Error)
 			<< "Failed to start camera " << camera->name();
@@ -333,7 +345,7 @@ void PipelineHandlerSimple::stop(Camera *camera)
 {
 	int ret;
 
-	ret = video_->streamOff();
+	ret = video_[0]->streamOff();
 	if (ret)
 		LOG(Simple, Warning)
 			<< "Failed to stop camera " << camera->name();
@@ -353,7 +365,7 @@ int PipelineHandlerSimple::queueRequest(Camera *camera, Request *request)
 		return -ENOENT;
 	}
 
-	int ret = video_->queueBuffer(buffer);
+	int ret = video_[0]->queueBuffer(buffer);
 	if (ret < 0)
 		return ret;
 
@@ -388,22 +400,44 @@ int PipelineHandlerSimple::createCamera(MediaEntity *sensor)
 
 bool PipelineHandlerSimple::match(DeviceEnumerator *enumerator)
 {
-	const MediaPad *pad;
+	const MediaPad *pad[MAX_PHYS];
+	unsigned int j;
 
-	static const SimplePipelineInfo infos[1] = {
-		{ .driverName = "sun6i-csi",
-		  .phyName = "sun6i-csi",
-		  .v4l2Name = "sun6i-csi",
+	static const SimplePipelineInfo infos[] = {
+		{
+		  .driverName = "sun6i-csi",
+		  .phyNames = { "sun6i-csi" },
+		  .subdevNames = { "" },
+		  .vdevNames = { "sun6i-csi" },
 		  .v4l2PixFmt = V4L2_PIX_FMT_UYVY,
 		  .mediaBusFmt = MEDIA_BUS_FMT_UYVY8_2X8,
 		  .maxWidth = 1280,
-		  .maxHeight = 720 }
+		  .maxHeight = 720,
+		},
+		{
+		  .driverName = "qcom-camss",
+		  .phyNames = { "msm_csiphy0" },
+		  .subdevNames = { "msm_csid0", "msm_ispif0" },
+		  .vdevNames = { "msm_vfe0_video0"},
+		  .v4l2PixFmt = V4L2_PIX_FMT_SRGGB10P,
+		  .mediaBusFmt = MEDIA_BUS_FMT_SRGGB10_1X10,
+		  .maxWidth = 1920,
+		  .maxHeight = 1080,
+		},
 	};
 
 	const SimplePipelineInfo *ptr = infos;
-	for (int i = 0; i < 1; i++, ptr++) {
+	for (int i = 0; i < 2; i++, ptr++) {
 		DeviceMatch dm(ptr->driverName);
-		dm.add(ptr->phyName);
+
+		for (j = 0; ptr->phyNames[j].length(); j++)
+			dm.add(ptr->phyNames[j]);
+
+		for (j = 0; ptr->subdevNames[j].length(); j++)
+			dm.add(ptr->subdevNames[j]);
+
+		for (j = 0; ptr->vdevNames[j].length(); j++)
+			dm.add(ptr->vdevNames[j]);
 
 		media_ = acquireMediaDevice(enumerator, dm);
 		if (!media_)
@@ -412,27 +446,43 @@ bool PipelineHandlerSimple::match(DeviceEnumerator *enumerator)
 		PipelineHandlerSimple::pipelineInfo_ = ptr;
 
 		/* Create the V4L2 subdevices we will need. */
-		dphy_ = V4L2Subdevice::fromEntityName(media_, ptr->phyName);
-		if (dphy_->open() < 0)
-			return false;
+		for (j = 0; ptr->phyNames[j].length(); j++) {
+			dphy_[j] = V4L2Subdevice::fromEntityName(media_,
+							ptr->phyNames[j]);
+			if (dphy_[j]->open() < 0)
+				return false;
+		}
+
+		for (j = 0; ptr->subdevNames[j].length(); j++) {
+			subdev_[j] = V4L2Subdevice::fromEntityName(media_,
+							ptr->subdevNames[j]);
+			if (subdev_[j]->open() < 0)
+				return false;
+		}
 
 		/* Locate and open the capture video node. */
-		video_ = V4L2VideoDevice::fromEntityName(media_, ptr->v4l2Name);
-		if (video_->open() < 0)
-			return false;
+		for (j = 0; ptr->vdevNames[j].length(); j++) {
+			video_[j] = V4L2VideoDevice::fromEntityName(media_,
+							ptr->vdevNames[j]);
+			if (video_[j]->open() < 0)
+				return false;
 
-		video_->bufferReady.connect(this, &PipelineHandlerSimple::bufferReady);
+			video_[j]->bufferReady.connect(this,
+				&PipelineHandlerSimple::bufferReady);
+		}
 
 		/*
-             * Enumerate all sensors connected to the CSI-2 receiver and create one
-             * camera instance for each of them.
-             */
-		pad = dphy_->entity()->getPadByIndex(0);
-		if (!pad)
-			return false;
+		 * Enumerate all sensors connected to the CSI-2 receiver
+		 * and create one camera instance for each of them.
+		 */
+		for (j = 0; ptr->phyNames[j].length(); j++) {
+			pad[j] = dphy_[j]->entity()->getPadByIndex(0);
+			if (!pad[j])
+				return false;
 
-		for (MediaLink *link : pad->links())
-			createCamera(link->source()->entity());
+			for (MediaLink *link : pad[j]->links())
+				createCamera(link->source()->entity());
+		}
 
 		return true;
 	}
